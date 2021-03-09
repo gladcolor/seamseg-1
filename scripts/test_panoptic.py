@@ -3,9 +3,15 @@ import time
 from collections import OrderedDict
 from functools import partial
 from os import path, mkdir
+import glob
+import os
+import PIL
+
+from tqdm import tqdm
 
 import numpy as np
 import torch
+import torchvision as tv
 import torch.utils.data as data
 import umsgpack
 from PIL import Image
@@ -75,6 +81,7 @@ def make_dataloader(args, config, rank, world_size):
                                config.getstruct("rgb_mean"),
                                config.getstruct("rgb_std"))
     test_db = ISSTestDataset(args.data, test_tf)
+    # print(test_db)
     test_sampler = DistributedARBatchSampler(test_db, config.getint("val_batch_size"), world_size, rank, False)
     test_dl = data.DataLoader(test_db,
                               batch_sampler=test_sampler,
@@ -177,9 +184,43 @@ def make_model(config, num_thing, num_stuff):
     # Create final network
     return PanopticNet(body, rpn_head, roi_head, sem_head, rpn_algo, roi_algo, sem_algo, classes)
 
+def get_img_tensor(img_path, clip=True):
+    img_raw = Image.open(img_path)
+    # clip image. Huan
+    w, h = img_raw.size
+    top = 0
+    if clip:
+        top = int(h / 2)
+    bottom = h
+    left = 0
+    right = w
+    print("img_raw.size, int(w / 2):", img_raw.size, int(w / 2))
+    print("left, top, right, bottom:", left, top, right, bottom)
+    img_raw = img_raw.crop((left, top, right, bottom))
+    size = (bottom - top, right - left)
+    img = torch.from_numpy(np.array(img_raw)/255)
+    print("torch.from_numpy(np.array(img_raw)):", img.shape)
+    return img
+
+def get_test_input(img_path, clip=True):
+    img_tensor = get_img_tensor(img_path, clip=clip)
+    input_batch = {}
+    input_batch['img'] = torch.unsqueeze(img_tensor, 0)
+    input_batch['idx'] = 0
+    input_batch['size'] = (img_tensor[0][1], img_tensor[0][2])
+    input_batch['img_path'] = img_path
+    in_dir = os.path.dirname(img_path)
+    input_batch['rel_path'] = os.path.relpath(img_path, in_dir)
+    return  input_batch
+
 
 def test(model, dataloader, **varargs):
+    torch.cuda.empty_cache()
+
+    # model.half()
     model.eval()
+
+    torch.cuda.empty_cache()
     dataloader.batch_sampler.set_epoch(0)
 
     data_time_meter = AverageMeter(())
@@ -190,49 +231,102 @@ def test(model, dataloader, **varargs):
     save_function = varargs["save_function"]
 
     data_time = time.time()
-    for it, batch in enumerate(dataloader):
-        with torch.no_grad():
-            # Extract data
-            img = batch["img"].cuda(device=varargs["device"], non_blocking=True)
 
-            data_time_meter.update(torch.tensor(time.time() - data_time))
+    img_dir = r'/media/huan/Huan1/DC_panoramas1'
+    img_files = glob.glob(os.path.join(img_dir, '*.jpg'))
 
-            batch_time = time.time()
+    # for p in varargs:
+    #     print("varargs:", str(p))
 
-            # Run network
-            _, pred, _ = model(img=img, do_loss=False, do_prediction=True)
+    for it, batch in tqdm(enumerate(dataloader)):
+    # for it, img_path in tqdm(enumerate(img_files)):
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.empty_cache()
+            with torch.no_grad():
+                torch.cuda.empty_cache()
 
-            # Update meters
-            batch_time_meter.update(torch.tensor(time.time() - batch_time))
+                # Extract data
+                # batch = get_test_input(img_path)
+                # for k in batch.keys():
+                #     print("batch: ", k, batch[k])
+                print("Processing: ", batch['idx'])
 
-            for i, (sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred) in enumerate(zip(
-                    pred["sem_pred"], pred["bbx_pred"], pred["cls_pred"], pred["obj_pred"], pred["msk_pred"])):
-                img_info = {
-                    "batch_size": batch["img"][i].shape[-2:],
-                    "original_size": batch["size"][i],
-                    "rel_path": batch["rel_path"][i],
-                    "abs_path": batch["abs_path"][i]
-                }
+                img = batch["img"].cuda(device=varargs["device"], non_blocking=True)
 
-                # Compute panoptic output
-                panoptic_pred = make_panoptic(sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred, num_stuff)
+                # print("type(img)", type(img))
 
-                # Save prediction
-                raw_pred = (sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred)
-                save_function(raw_pred, panoptic_pred, img_info)
 
-            # Log batch
-            if varargs["summary"] is not None and (it + 1) % varargs["log_interval"] == 0:
-                logging.iteration(
-                    None, "val", 0, 1, 1,
-                    it + 1, len(dataloader),
-                    OrderedDict([
-                        ("data_time", data_time_meter),
-                        ("batch_time", batch_time_meter)
-                    ])
-                )
 
-            data_time = time.time()
+                data_time_meter.update(torch.tensor(time.time() - data_time))
+
+                batch_time = time.time()
+
+                # Run network
+                xx, pred, xxx = model(img=img, do_loss=False, do_prediction=True)
+                del img
+                torch.cuda.empty_cache()
+                del xx
+                torch.cuda.empty_cache()
+                del xxx
+                torch.cuda.empty_cache()
+
+                # print("pred:", pred["sem_pred"].device)
+
+                # Update meters
+                batch_time_meter.update(torch.tensor(time.time() - batch_time))
+
+                for i, (sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred) in enumerate(zip(
+                        pred["sem_pred"], pred["bbx_pred"], pred["cls_pred"], pred["obj_pred"], pred["msk_pred"])):
+                    img_info = {
+                        "batch_size": batch["img"][i].shape[-2:],
+                        "original_size": batch["size"][i],
+                        "rel_path": batch["rel_path"][i],
+                        "abs_path": batch["abs_path"][i]
+                    }
+
+                    # Compute panoptic output
+                    panoptic_pred = make_panoptic(sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred, num_stuff)
+                    # print("panoptic_pred: ", panoptic_pred.device)
+
+                    # Save prediction
+                    raw_pred = (sem_pred, bbx_pred, cls_pred, obj_pred, msk_pred)
+                    save_function(raw_pred, panoptic_pred, img_info)
+
+                    del sem_pred
+                    torch.cuda.empty_cache()
+                    del msk_pred
+                    torch.cuda.empty_cache()
+                    del bbx_pred
+                    torch.cuda.empty_cache()
+                    del cls_pred
+                    torch.cuda.empty_cache()
+                    del obj_pred
+                    torch.cuda.empty_cache()
+
+                del pred
+                torch.cuda.empty_cache()
+                # Log batch
+                if varargs["summary"] is not None and (it + 1) % varargs["log_interval"] == 0:
+                    logging.iteration(
+                        None, "val", 0, 1, 1,
+                        it + 1, len(dataloader),
+                        OrderedDict([
+                            ("data_time", data_time_meter),
+                            ("batch_time", batch_time_meter)
+                        ])
+                    )
+
+                data_time = time.time()
+
+                torch.cuda.empty_cache()
+
+        except Exception as e:
+            print("Error in tqdm(enumerate(dataloader))", e)
+         #   torch.cuda.empty_cache()
+            time.sleep(2)
+         #   model.eval()
+            continue
 
 
 def ensure_dir(dir_path):
@@ -243,9 +337,24 @@ def ensure_dir(dir_path):
 
 
 def save_prediction_image(_, panoptic_pred, img_info, out_dir, colors, num_stuff):
+
+    vistas_pallete = np.array(colors).flatten().tolist()[:]
+    # print("vistas_pallete: ", vistas_pallete.shape, vistas_pallete)
+    # print("colors: ", colors.shape, colors)
+
     msk, cat, obj, iscrowd = panoptic_pred
 
     img = Image.open(img_info["abs_path"])
+    w, h = img.size
+    top = int(h / 2)
+    bottom = h
+    left = 0
+    right = w
+    img = img.crop((left, top, right, bottom))
+    print("img.size:", img.size)
+
+    save_blend = False
+    save_contour = False
 
     # Prepare folders and paths
     folder, img_name = path.split(img_info["rel_path"])
@@ -258,26 +367,70 @@ def save_prediction_image(_, panoptic_pred, img_info, out_dir, colors, num_stuff
     sem = cat[msk].numpy()
     crowd = iscrowd[msk].numpy()
     sem[crowd == 1] = 255
+    # huan
+    out_path_png = out_path.replace(".jpg", ".png")
 
-    sem_img = Image.fromarray(colors[sem])
-    sem_img = sem_img.resize(img_info["original_size"][::-1])
+    print("output segmenation shape:", sem.shape)
 
+    sem_img = Image.fromarray((sem + 0).astype('uint8'))
+    # sem_img = sem_img.resize(img_info["original_size"][::-1], resample=PIL.Image.NEAREST)
+    sem_img.putpalette(vistas_pallete)
+    # sem_img.save(out_path_png.replace(".png", "_no_contour.png"))
+    print("\nSaved _no_contour: ", out_path_png)
+    # print("sem_img.shape: ", sem_img.size)
+
+
+    # sem_img = Image.fromarray(colors[sem])
+
+    # print("after colors, sem_img.shape: ", sem_img.size)
+
+    # print("colors[sem]:", colors[sem].shape, colors[sem])
+    # sem_img = sem_img.resize(img_info["original_size"][::-1])
+    # sem_img_cate =
+
+    # print("after resize, sem_img.shape: ", sem_img.size)
+
+    sem_img.save(out_path_png)
+    print("\nSaved out_path_png: ", out_path_png)
+
+    # print("sem:", type(sem), sem.shape, sem)
+    # print("Colors:", type(colors), colors.shape, colors)
+    # sem_img = Image.fromarray(sem.astype(np.uint8))
+    # sem_img.putpalette(colors)
+    # sem_img.save(out_path_png.replace(".png", "_seg.png"))
+    # print("\nSaved seg_png: ", out_path_png)
+
+
+    if save_contour:
     # Render contours
-    is_background = (sem < num_stuff) | (sem == 255)
-    msk = msk.numpy()
-    msk[is_background] = 0
+        is_background = (sem < num_stuff) | (sem == 255)
+        msk = msk.numpy()
+        msk[is_background] = 0
 
-    contours = find_boundaries(msk, mode="outer", background=0).astype(np.uint8) * 255
-    contours = dilation(contours)
+        contours = find_boundaries(msk, mode="outer", background=0).astype(np.uint8) * 255
+        contours = dilation(contours)
 
-    contours = np.expand_dims(contours, -1).repeat(4, -1)
-    contours_img = Image.fromarray(contours, mode="RGBA")
-    contours_img = contours_img.resize(img_info["original_size"][::-1])
+        contours = np.expand_dims(contours, -1).repeat(4, -1)
+        contours_img = Image.fromarray(contours, mode="RGBA")
+        contours_img = contours_img.resize(img_info["original_size"][::-1])
+
+
+    # contours_img.save(out_path_png)
 
     # Compose final image and save
-    out = Image.blend(img, sem_img, 0.5).convert(mode="RGBA")
-    out = Image.alpha_composite(out, contours_img)
-    out.convert(mode="RGB").save(out_path)
+    if save_blend:
+        out = Image.blend(img, sem_img, 0.5).convert(mode="RGBA")
+        # out_no_image = Image.blend(img, sem_img, 0.5).convert(mode="RGBA")
+        # out = Image.blend(img, sem_img, 0.5).convert(mode="RGBA")
+
+        out = Image.alpha_composite(out, contours_img)
+        out.convert(mode="RGB").save(out_path)
+        del out
+    del sem_img
+
+    del panoptic_pred
+
+#
 
 
 def save_prediction_raw(raw_pred, _, img_info, out_dir):
@@ -339,6 +492,7 @@ def main(args):
                 palette.append(meta["palette"][i])
             else:
                 palette.append((0, 0, 0))
+            # print(palette[i])
         palette = np.array(palette, dtype=np.uint8)
 
         save_function = partial(
